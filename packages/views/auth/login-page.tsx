@@ -111,6 +111,10 @@ export function LoginPage({
   const [step, setStep] = useState<"email" | "code" | "cli_confirm">("email");
   const [email, setEmail] = useState("");
   const [code, setCode] = useState("");
+  // "password" = email+password direct login (self-hosted env credentials);
+  // "code" = the original email verification-code flow.
+  const [mode, setMode] = useState<"password" | "code">("password");
+  const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [cooldown, setCooldown] = useState(0);
@@ -187,6 +191,46 @@ export function LoginPage({
       }
     },
     [email, t],
+  );
+
+  const handlePasswordLogin = useCallback(
+    async (e?: React.FormEvent) => {
+      e?.preventDefault();
+      if (!email || !password) {
+        setError(t(($) => $.signin.password_required));
+        return;
+      }
+      setLoading(true);
+      setError("");
+      try {
+        if (cliCallback) {
+          // CLI path: get token directly for the redirect URL
+          const { token } = await api.passwordLogin(email, password);
+          localStorage.setItem("multica_token", token);
+          api.setToken(token);
+          onTokenObtained?.();
+          redirectToCliCallback(cliCallback.url, token, cliCallback.state);
+          return;
+        }
+
+        // Normal path: seed the workspace list into the Query cache so the
+        // caller's onSuccess can read it synchronously to compute a
+        // destination URL.
+        await useAuthStore.getState().passwordLogin(email, password);
+        const wsList = await api.listWorkspaces();
+        qc.setQueryData(workspaceKeys.list(), wsList);
+        onTokenObtained?.();
+        onSuccess();
+      } catch (err) {
+        setError(
+          err instanceof Error
+            ? err.message
+            : t(($) => $.signin.login_failed),
+        );
+        setLoading(false);
+      }
+    },
+    [email, password, onSuccess, cliCallback, onTokenObtained, qc, t],
   );
 
   const handleVerify = useCallback(
@@ -415,11 +459,17 @@ export function LoginPage({
             {t(($) => $.signin.title)}
           </CardTitle>
           <CardDescription>
-            {t(($) => $.signin.description)}
+            {mode === "password"
+              ? t(($) => $.signin.description_password)
+              : t(($) => $.signin.description)}
           </CardDescription>
         </CardHeader>
         <CardContent>
-          <form id="login-form" onSubmit={handleSendCode} className="space-y-4">
+          <form
+            id="login-form"
+            onSubmit={mode === "password" ? handlePasswordLogin : handleSendCode}
+            className="space-y-4"
+          >
             <div className="space-y-2">
               <Label htmlFor="login-email">{t(($) => $.common.email)}</Label>
               <Input
@@ -432,6 +482,22 @@ export function LoginPage({
                 required
               />
             </div>
+            {mode === "password" && (
+              <div className="space-y-2">
+                <Label htmlFor="login-password">
+                  {t(($) => $.signin.password)}
+                </Label>
+                <Input
+                  id="login-password"
+                  type="password"
+                  placeholder={t(($) => $.signin.password_placeholder)}
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  disabled={loading}
+                  required
+                />
+              </div>
+            )}
             {error && (
               <p className="text-body text-destructive">{error}</p>
             )}
@@ -443,12 +509,26 @@ export function LoginPage({
             form="login-form"
             className="w-full"
             size="lg"
-            disabled={!email || loading}
+            disabled={!email || loading || (mode === "password" && !password)}
           >
             {loading
-              ? t(($) => $.signin.sending)
+              ? mode === "password"
+                ? t(($) => $.signin.signing_in)
+                : t(($) => $.signin.sending)
               : t(($) => $.signin.continue)}
           </Button>
+          <button
+            type="button"
+            className="w-full text-body text-muted-foreground underline-offset-4 hover:underline"
+            onClick={() => {
+              setMode((m) => (m === "password" ? "code" : "password"));
+              setError("");
+            }}
+          >
+            {mode === "password"
+              ? t(($) => $.signin.use_code)
+              : t(($) => $.signin.use_password)}
+          </button>
           {(google || onGoogleLogin) && (
             <Button
               type="button"

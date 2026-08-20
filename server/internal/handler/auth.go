@@ -40,6 +40,14 @@ var ErrEmailNotAllowed = SignupError{Message: "email address or domain not allow
 
 const devVerificationCodeEnv = "MULTICA_DEV_VERIFICATION_CODE"
 
+// Password login (self-hosting convenience): a single account configured via
+// env. Both must be set for /auth/login to be active; otherwise the endpoint
+// 404s so a default deployment gains no extra auth surface.
+const (
+	localAuthEmailEnv    = "MULTICA_AUTH_EMAIL"
+	localAuthPasswordEnv = "MULTICA_AUTH_PASSWORD"
+)
+
 // supportedLanguages mirrors `SUPPORTED_LOCALES` in packages/core/i18n/types.ts.
 // Keep both lists in sync when adding a locale — the user-controlled `language`
 // field round-trips through GetMe back into i18n.changeLanguage(), so without
@@ -109,6 +117,11 @@ type SendCodeRequest struct {
 type VerifyCodeRequest struct {
 	Email string `json:"email"`
 	Code  string `json:"code"`
+}
+
+type PasswordLoginRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
 }
 
 func generateCode() (string, error) {
@@ -444,6 +457,92 @@ func (h *Handler) VerifyCode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	slog.Info("user logged in", append(logger.RequestAttrs(r), "user_id", uuidToString(user.ID), "email", user.Email)...)
+	writeJSON(w, http.StatusOK, LoginResponse{
+		Token: tokenString,
+		User:  h.userToResponse(user),
+	})
+}
+
+// PasswordLogin authenticates against a single account configured via env
+// (MULTICA_AUTH_EMAIL / MULTICA_AUTH_PASSWORD). Self-hosting convenience: no
+// SMTP, no verification-code round-trip. Constant-time compares, a uniform
+// error message and a fixed delay on mismatch blunt brute-force probing.
+func (h *Handler) PasswordLogin(w http.ResponseWriter, r *http.Request) {
+	var req PasswordLoginRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	email := strings.ToLower(strings.TrimSpace(req.Email))
+	password := req.Password
+	if email == "" || password == "" {
+		writeError(w, http.StatusBadRequest, "email and password are required")
+		return
+	}
+
+	configuredEmail := strings.ToLower(strings.TrimSpace(os.Getenv(localAuthEmailEnv)))
+	configuredPassword := os.Getenv(localAuthPasswordEnv)
+	if configuredEmail == "" || configuredPassword == "" {
+		writeError(w, http.StatusNotFound, "password login is not configured")
+		return
+	}
+
+	emailOK := subtle.ConstantTimeCompare([]byte(email), []byte(configuredEmail)) == 1
+	passwordOK := subtle.ConstantTimeCompare([]byte(password), []byte(configuredPassword)) == 1
+	if !emailOK || !passwordOK {
+		time.Sleep(300 * time.Millisecond)
+		writeError(w, http.StatusUnauthorized, "invalid email or password")
+		return
+	}
+
+	if auth.IsTemporarilyDisabledUserEmail(email) {
+		writeError(w, http.StatusForbidden, auth.TemporarilyDisabledUserError)
+		return
+	}
+
+	user, isNew, err := h.findOrCreateUser(r.Context(), email)
+	if err != nil {
+		if errors.Is(err, auth.ErrTemporarilyDisabledUser) {
+			writeError(w, http.StatusForbidden, auth.TemporarilyDisabledUserError)
+			return
+		}
+		var signupErr SignupError
+		if errors.As(err, &signupErr) {
+			writeError(w, http.StatusForbidden, signupErr.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to create user")
+		return
+	}
+	if isNew {
+		evt := analytics.Signup(uuidToString(user.ID), user.Email, signupSourceFromRequest(r))
+		evt.Properties["auth_method"] = "password"
+		obsmetrics.RecordEvent(h.Analytics, h.Metrics, evt)
+	}
+
+	tokenString, err := h.issueJWT(user)
+	if err != nil {
+		if errors.Is(err, auth.ErrTemporarilyDisabledUser) {
+			writeError(w, http.StatusForbidden, auth.TemporarilyDisabledUserError)
+			return
+		}
+		slog.Warn("password login failed", append(logger.RequestAttrs(r), "error", err, "email", req.Email)...)
+		writeError(w, http.StatusInternalServerError, "failed to generate token")
+		return
+	}
+
+	if err := auth.SetAuthCookies(w, tokenString); err != nil {
+		slog.Warn("failed to set auth cookies", "error", err)
+	}
+
+	if h.CFSigner != nil {
+		for _, cookie := range h.CFSigner.SignedCookies(time.Now().Add(auth.AuthTokenTTL())) {
+			http.SetCookie(w, cookie)
+		}
+	}
+
+	slog.Info("user logged in with password", append(logger.RequestAttrs(r), "user_id", uuidToString(user.ID), "email", user.Email)...)
 	writeJSON(w, http.StatusOK, LoginResponse{
 		Token: tokenString,
 		User:  h.userToResponse(user),
